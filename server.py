@@ -159,7 +159,9 @@ def get_greeting(name: str) -> str:
 def health_check() -> Dict[str, str]:
     """Check the server's health status."""
     # Simplified health check to avoid potential issues
-    is_logged_in = hasattr(cl, 'user_id') and cl.user_id is not None
+    # NOTE (local patch): upstream referenced an undefined variable `cl`
+    # (the module-level client is `client`), so health_check always crashed.
+    is_logged_in = hasattr(client, 'user_id') and client.user_id is not None
     
     result = {
         "status": "healthy",
