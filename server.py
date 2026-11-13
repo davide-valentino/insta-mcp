@@ -18,9 +18,13 @@ logging.basicConfig(
 # Version information
 VERSION = "1.3.5"
 
-# Force all stdout to go to stderr
-# This is to prevent any accidental print statements from breaking the MCP protocol
-sys.stdout = sys.stderr
+# NOTE (local patch): do NOT redirect sys.stdout to sys.stderr here. The mcp SDK
+# writes protocol frames through the sys.stdout object, so swapping it sends the
+# MCP protocol itself to stderr and the client times out. fastmcp logging is
+# already configured to stderr above; keep stdout untouched as the protocol
+# channel. Upstream comment claimed this prevented stray prints breaking the
+# protocol, but it has the opposite effect with current mcp SDK versions.
+# sys.stdout = sys.stderr
 
 # Track startup time
 startup_time = time.time()
