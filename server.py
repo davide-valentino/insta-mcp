@@ -6,6 +6,7 @@ import sys
 import logging
 from typing import Dict, Any
 import time
+import re
 
 # Set up logging to stderr instead of stdout
 logging.basicConfig(
@@ -77,6 +78,101 @@ except Exception as e:
     logging.error(f"Failed to initialize Instagram client: {e}")
     # Continue without raising to allow server to start
 
+# NOTE (local patch): media metadata extraction. Upstream read_dms returned
+# msg.text only, so every shared reel, post, story or story mention arrived as
+# text: None. Modern shares come as xma_* item types; instagrapi models those
+# through msg.xma_share (canonical instagram.com/<reel|p>/<code> URL plus the
+# caption in .title) and keeps the raw payload for unmodelled ones in msg.raw_xma.
+IG_PATH_RE = re.compile(
+    r"instagram\.com/(reels?/|p/|tv/|stories/[A-Za-z0-9_.]+?(?:/[0-9]+)?/)([A-Za-z0-9_-]+)"
+)
+MEDIA_TYPE_NAMES = {1: "image", 2: "video", 8: "carousel"}
+
+
+def _canonical_share_url(url: str) -> str:
+    """Strip tracking params from an Instagram share URL; None if not a web URL."""
+    if not url:
+        return None
+    match = IG_PATH_RE.search(url)
+    if match:
+        return f"https://www.instagram.com/{match.group(1)}{match.group(2)}/"
+    plain = url.split("?", 1)[0]
+    return plain if plain.startswith("http") else None
+
+
+def _media_from_xma(xma) -> dict:
+    if not xma or not getattr(xma, "video_url", None):
+        return None
+    url = _canonical_share_url(xma.video_url)
+    caption = (xma.title or "").strip() or None
+    if not url and not caption:
+        return None
+    kind = "media"
+    segment = IG_PATH_RE.search(xma.video_url)
+    if segment:
+        path = segment.group(1).rstrip("/")
+        kind = "reel" if "reel" in path else "story" if "stories" in path else "post"
+    return {"kind": kind, "url": url, "caption": caption}
+
+
+def _media_from_raw_xma(xma_share, raw) -> dict:
+    """Fallback for unmodelled xma item types (e.g. xma_story_share): the raw
+    payload keeps target_url and the caption in title/caption body text."""
+    if xma_share or not raw:
+        return None
+    for key, items in raw.items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = _canonical_share_url(item.get("target_url"))
+            caption = item.get("title_text") or item.get("subtitle_text") or item.get("caption_body_text")
+            caption = caption.strip() if isinstance(caption, str) else None
+            if url or caption:
+                return {"kind": "story" if "story" in key else "media", "url": url, "caption": caption}
+    return None
+
+
+def _media_from_media_obj(media) -> dict:
+    """Full Media objects (media_share posts, clip reels) carry code + caption."""
+    if not media or not media.code:
+        return None
+    if media.product_type == "clips":
+        kind, path = "reel", "reel"
+    else:
+        kind, path = "post", "p"
+    return {
+        "kind": kind,
+        "url": f"https://www.instagram.com/{path}/{media.code}/",
+        "caption": (media.caption_text or "").strip() or None,
+    }
+
+
+def _media_from_direct_media(media) -> dict:
+    """Photos/videos/audio sent directly inside the DM (not feed shares)."""
+    if not media:
+        return None
+    url = media.video_url or media.audio_url or media.thumbnail_url
+    if not url:
+        return None
+    return {"kind": MEDIA_TYPE_NAMES.get(media.media_type, "media"), "url": str(url), "caption": None}
+
+
+def _message_media_info(msg) -> dict:
+    """First populated share wins; typed xma_share is the most specific."""
+    for candidate in (
+        _media_from_xma(msg.xma_share),
+        _media_from_media_obj(msg.clip),
+        _media_from_media_obj(msg.media_share),
+        _media_from_direct_media(msg.media),
+        _media_from_raw_xma(msg.xma_share, msg.raw_xma),
+    ):
+        if candidate:
+            return candidate
+    return None
+
+
 # Tool: Read recent DMs
 @mcp.tool()
 def read_dms(limit: int = 10) -> Dict[str, Any]:
@@ -86,7 +182,7 @@ def read_dms(limit: int = 10) -> Dict[str, Any]:
         limit (int): Number of threads/messages to fetch (default: 10)
     
     Returns:
-        dict: List of messages with sender, text, and timestamp
+        dict: List of messages with sender, text, media metadata, and timestamp
     """
     try:
         inbox = client.direct_threads(amount=limit)
@@ -105,13 +201,35 @@ def read_dms(limit: int = 10) -> Dict[str, Any]:
                     sender_username = next((user.username for user in thread.users if hasattr(user, 'username') and user.pk == msg.user_id), None)
                 except:
                     pass
+
+                # NOTE (local patch): surface non-text content. Keep the
+                # original keys untouched; null fields mean absent.
+                media_info = _message_media_info(msg)
+                link_info = None
+                if msg.link and msg.link.link_context:
+                    link_info = {
+                        "url": msg.link.link_context.link_url,
+                        "title": msg.link.link_context.link_title,
+                        "summary": msg.link.link_context.link_summary,
+                    }
+                reply_to = None
+                if msg.reply:
+                    reply_to = {"item_type": msg.reply.item_type, "text": msg.reply.text}
+                reactions = []
+                if msg.reactions and msg.reactions.emojis:
+                    reactions = [r.emoji for r in msg.reactions.emojis]
                 
                 messages.append({
                     "thread": thread_info,
                     "sender_id": msg.user_id,
                     "sender": sender_username,
                     "text": msg.text,
-                    "timestamp": msg.timestamp.isoformat() if msg.timestamp else None
+                    "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+                    "item_type": msg.item_type,
+                    "media": media_info,
+                    "link": link_info,
+                    "reply_to": reply_to,
+                    "reactions": reactions,
                 })
         return {"status": "success", "messages": messages}
     except Exception as e:
