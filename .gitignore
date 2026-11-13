@@ -39,3 +39,8 @@ instagram_cookies-backup.json
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Node / npm build artifacts (node_modules was committed upstream in the
+# single "First revision" commit by mistake; the Python MCP path needs none
+# of it and we run server.py directly)
+node_modules/
